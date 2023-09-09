@@ -11,11 +11,14 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 import os
 from pathlib import Path
+import random
 import subprocess as sp
 from tempfile import NamedTemporaryFile
 import time
 import typing as tp
 import warnings
+
+import numpy as np
 
 import torch
 import gradio as gr
@@ -50,6 +53,25 @@ pool.__enter__()
 def interrupt():
     global INTERRUPTING
     INTERRUPTING = True
+
+
+# Function to validate text input
+def validate_text_input(text):
+    prohibited_words = ['profanity', 'explicit']
+    for word in prohibited_words:
+        if word.lower() in text.lower():
+            raise gr.Error(f"The word '{word}' is not allowed.")
+
+
+# From https://gist.github.com/gatheluck/c57e2a40e3122028ceaecc3cb0d152ac
+def set_all_seeds(seed):
+    seed = int(seed)  # Cast seed to integer
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
 
 
 class FileCleaner:
@@ -92,13 +114,25 @@ def load_model(version='melody'):
         MODEL = MusicGen.get_pretrained(version)
 
 
-def _do_predictions(texts, melodies, duration, progress=False, **gen_kwargs):
+def _do_predictions(texts, melodies, duration, progress=False, seed=None, **gen_kwargs):
+    # Validate text input for prohibited words
+    for text in texts:
+        validate_text_input(text)
+
+    # Set seed here to affect both text and melody
+    if seed is not None:
+        set_all_seeds(seed)
+
     MODEL.set_generation_params(duration=duration, **gen_kwargs)
+    print(f"Current seed for numpy: {np.random.get_state()[1][0]}, for torch: {torch.initial_seed()}")
     print("new batch", len(texts), texts, [None if m is None else (m[0], m[1].shape) for m in melodies])
-    be = time.time()
+
     processed_melodies = []
     target_sr = 32000
     target_ac = 1
+
+    be = time.time()
+
     for melody in melodies:
         if melody is None:
             processed_melodies.append(None)
@@ -110,44 +144,61 @@ def _do_predictions(texts, melodies, duration, progress=False, **gen_kwargs):
             melody = convert_audio(melody, sr, target_sr, target_ac)
             processed_melodies.append(melody)
 
+    # Set the seed right before the model generates the music
+    if seed is not None:
+        set_all_seeds(seed)
+
     if any(m is not None for m in processed_melodies):
         outputs = MODEL.generate_with_chroma(
             descriptions=texts,
             melody_wavs=processed_melodies,
             melody_sample_rate=target_sr,
-            progress=progress,
+            progress=progress
         )
     else:
         outputs = MODEL.generate(texts, progress=progress)
 
     outputs = outputs.detach().cpu().float()
+
     out_files = []
     for output in outputs:
         with NamedTemporaryFile("wb", suffix=".wav", delete=False) as file:
             audio_write(
                 file.name, output, MODEL.sample_rate, strategy="loudness",
-                loudness_headroom_db=16, loudness_compressor=True, add_suffix=False)
+                loudness_headroom_db=16, loudness_compressor=True, add_suffix=False
+            )
             out_files.append(pool.submit(make_waveform, file.name))
             file_cleaner.add(file.name)
+
     res = [out_file.result() for out_file in out_files]
+
     for file in res:
         file_cleaner.add(file)
+
     print("batch finished", len(texts), time.time() - be)
     print("Tempfiles currently stored: ", len(file_cleaner.files))
+
     return res
 
 
-def predict_batched(texts, melodies):
+def predict_batched(texts, melodies, seed=None):
+    if seed is not None:
+        set_all_seeds(seed)
     max_text_length = 512
     texts = [text[:max_text_length] for text in texts]
     load_model('melody')
-    res = _do_predictions(texts, melodies, BATCHED_DURATION)
+    res = _do_predictions(texts, melodies, BATCHED_DURATION, seed=seed)
     return [res]
 
 
-def predict_full(model, text, melody, duration, topk, topp, temperature, cfg_coef, progress=gr.Progress()):
+def predict_full(model, text, melody, duration, topk, topp, temperature, cfg_coef, seed=None, progress=gr.Progress()):
+    print("Received melody: ", melody)
     global INTERRUPTING
     INTERRUPTING = False
+
+    if seed is not None:
+        set_all_seeds(seed)
+
     if temperature < 0:
         raise gr.Error("Temperature must be >= 0.")
     if topk < 0:
@@ -164,9 +215,8 @@ def predict_full(model, text, melody, duration, topk, topp, temperature, cfg_coe
             raise gr.Error("Interrupted.")
     MODEL.set_custom_progress_callback(_progress)
 
-    outs = _do_predictions(
-        [text], [melody], duration, progress=True,
-        top_k=topk, top_p=topp, temperature=temperature, cfg_coef=cfg_coef)
+    outs = _do_predictions([text], [melody], duration, progress=True, seed=seed, top_k=topk,
+                           top_p=topp, temperature=temperature, cfg_coef=cfg_coef)
     return outs[0]
 
 
@@ -210,10 +260,11 @@ def ui_full(launch_kwargs):
                     topp = gr.Number(label="Top-p", value=0, interactive=True)
                     temperature = gr.Number(label="Temperature", value=1.0, interactive=True)
                     cfg_coef = gr.Number(label="Classifier Free Guidance", value=3.0, interactive=True)
+                    seed = gr.Number(label="Seed", value=None, interactive=True)
             with gr.Column():
                 output = gr.Video(label="Generated Music")
         submit.click(predict_full,
-                     inputs=[model, text, melody, duration, topk, topp, temperature, cfg_coef],
+                     inputs=[model, text, melody, duration, topk, topp, temperature, cfg_coef, seed],
                      outputs=[output])
         radio.change(toggle_audio_src, radio, [melody], queue=False, show_progress=False)
         gr.Examples(
